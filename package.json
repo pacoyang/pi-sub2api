@@ -1,0 +1,47 @@
+{
+  "name": "pi-sub2api",
+  "version": "0.1.0",
+  "description": "Pi extension for a sub2api gateway: dynamic model registration and a /usage command for balance and cost.",
+  "type": "module",
+  "license": "MIT",
+  "author": "pacoyang <yangbaigao@gmail.com>",
+  "homepage": "https://github.com/pacoyang/pi-sub2api#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pacoyang/pi-sub2api.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pacoyang/pi-sub2api/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "sub2api"
+  ],
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "pack:dry-run": "npm pack --dry-run"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.3",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
