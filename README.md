@@ -27,10 +27,7 @@ environment variables are needed.
   "sub2api": {
     "type": "api_key",
     "key": "sk-...",
-    "env": {
-      "SUB2API_BASE_URL": "https://your-sub2api-host",
-      "SUB2API_API": "auto"
-    }
+    "env": { "SUB2API_BASE_URL": "https://your-sub2api-host" }
   }
 }
 ```
@@ -42,8 +39,8 @@ chmod 600 ~/.pi/agent/auth.json
 - `key` — an API key generated in the sub2api dashboard.
 - `env.SUB2API_BASE_URL` — the gateway base URL, **without** a trailing `/v1`. Defaults to
   `http://localhost:8080`.
-- `env.SUB2API_API` — wire protocol: `auto` (default), `anthropic`, or `openai`. See
-  [Protocol](#protocol).
+- `env.SUB2API_API` — optional. Forces the wire protocol to `anthropic` or `openai`; omit it to
+  pick per model, which is what you want unless [Protocol](#protocol) says otherwise.
 
 pi resolves the key from `auth.json["sub2api"]` for inference; the extension reads the same entry
 for its own `/v1/models` and `/v1/usage` calls. `SUB2API_KEY` / `SUB2API_BASE_URL` / `SUB2API_API`
