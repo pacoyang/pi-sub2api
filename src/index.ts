@@ -66,13 +66,61 @@ function readSub2apiCredential(): { key: string; base: string } {
   };
 }
 
+/**
+ * Pull a human-readable message out of an error body. Gateways answer with
+ * `{ code, message }`, OpenAI-style `{ error: { message, code } }`, or plain text;
+ * anything unrecognised falls back to the (truncated) raw body.
+ */
+function describeErrorBody(body: string): string {
+  const text = body.trim();
+  if (!text) return "";
+  try {
+    const json = JSON.parse(text);
+    const err = json?.error ?? json;
+    const code = err?.code ?? err?.type;
+    const message = err?.message ?? err?.error ?? (typeof err === "string" ? err : undefined);
+    if (code || message) return [code, message].filter(Boolean).join(": ");
+  } catch {
+    // Not JSON; fall through to the raw text.
+  }
+  return text.length > 400 ? `${text.slice(0, 400)}…` : text;
+}
+
 async function fetchJson(url: string, key: string, timeoutMs = 8000): Promise<any> {
-  const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    // Network-level failure (DNS, refused connection, timeout): name the endpoint too.
+    // fetch reports these as a bare "fetch failed"; the real syscall error is in `cause`.
+    const e = err as Error & { cause?: { code?: string; message?: string } };
+    const cause = e.cause?.code ?? e.cause?.message;
+    const reason =
+      e.name === "TimeoutError"
+        ? `timed out after ${timeoutMs}ms`
+        : `${e.message}${cause ? ` (${cause})` : ""}`;
+    throw new Error(`GET ${url} failed — ${reason}`);
+  }
+  // statusText is empty over HTTP/2, so only append it when present.
+  const status = `HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ""}`;
+  let body: string;
+  try {
+    body = await res.text();
+  } catch (err) {
+    throw new Error(`GET ${url} → ${status} but the body could not be read — ${(err as Error).message}`);
+  }
+  if (!res.ok) {
+    const detail = describeErrorBody(body);
+    throw new Error(`GET ${url} → ${status}${detail ? ` — ${detail}` : ""}`);
+  }
+  try {
+    return JSON.parse(body);
+  } catch {
+    throw new Error(`GET ${url} → ${status} but the body is not JSON — ${describeErrorBody(body)}`);
+  }
 }
 
 // Render the GET /v1/usage response as a compact multi-line report.
@@ -106,19 +154,30 @@ export default async function (pi: ExtensionAPI) {
   // Codex / gpt-5 / o-series are reasoning models; infer the flag from the id.
   const isReasoning = (id: string) => /gpt-5|codex|^o[1-9]|reason|think/i.test(id);
 
+  const modelsUrl = `${base}/v1/models`;
+  if (!key) {
+    console.warn(`[sub2api] no API key found — set auth.json["sub2api"].key or $SUB2API_KEY; requests to ${modelsUrl} will be unauthenticated.`);
+  }
+
   let models: Array<{ id: string }> = [];
+  let fetchFailed = false;
   try {
-    const json = await fetchJson(`${base}/v1/models`, key);
+    const json = await fetchJson(modelsUrl, key);
     // Keep chat-capable models only; drop embeddings and image-generation models.
     models = ((json?.data as Array<{ id: string }>) ?? []).filter((m) => !/embedding|image/i.test(m.id));
   } catch (err) {
+    fetchFailed = true;
     console.warn(`[sub2api] models fetch failed: ${(err as Error).message}`);
   }
 
   if (models.length === 0) {
     // Nothing fetched: skip registration to avoid an empty provider.
     // Check the "sub2api" entry in ~/.pi/agent/auth.json and that the service is running.
-    console.warn("[sub2api] no models returned, skipping registration.");
+    console.warn(
+      fetchFailed
+        ? `[sub2api] skipping registration — see the error above (endpoint: ${modelsUrl}, config: ${join(agentDir(), "auth.json")} → "sub2api").`
+        : `[sub2api] ${modelsUrl} returned no usable models, skipping registration.`,
+    );
     return;
   }
 
