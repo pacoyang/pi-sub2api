@@ -17,12 +17,12 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
  *     "sub2api": {
  *       "type": "api_key",
  *       "key": "sk-...",
- *       "env": {
- *         "SUB2API_BASE_URL": "https://your-sub2api-host",
- *         "SUB2API_API": "auto"
- *       }
+ *       "env": { "SUB2API_BASE_URL": "https://your-sub2api-host" }
  *     }
  *   }
+ *
+ * SUB2API_API may be added to that env block to force a protocol; leaving it
+ * out picks one per model (see PROTOCOL below).
  *
  * pi resolves the key from auth.json["sub2api"] for inference; this extension reads
  * the same entry for its own /v1/models and /v1/usage calls.
