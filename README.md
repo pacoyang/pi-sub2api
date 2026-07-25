@@ -53,9 +53,13 @@ environment variables are used as a fallback if the `auth.json` entry is absent.
 
 sub2api dispatches on the platform of the API key's group, not on the request path. An
 Anthropic-account key serves `/v1/messages` natively and translates `/v1/chat/completions` down to
-it; an OpenAI-account key does the reverse. Both paths work for any key, but each costs a
-translation hop the native one does not, and groups flagged `claude_code_only` reject
-`/v1/chat/completions` with a 403 outright.
+it; an OpenAI-account key does the reverse. The non-native path costs a translation hop, and each
+side has a group flag that closes it outright:
+
+- `claude_code_only` — rejects `/v1/chat/completions` with a 403.
+- `allow_messages_dispatch` — an OpenAI group rejects `/v1/messages` unless this is on. **It
+  defaults to off**, so an OpenAI group that serves Claude model ids will not accept the Anthropic
+  protocol until an admin enables it.
 
 So each model is registered on the protocol native to it:
 
@@ -64,8 +68,16 @@ So each model is registered on the protocol native to it:
 | `claude-*` | `anthropic-messages` | `POST {BASE}/v1/messages` |
 | everything else | `openai-completions` | `POST {BASE}/v1/chat/completions` |
 
-Set `SUB2API_API` to `anthropic` or `openai` to force one protocol for every model. Forcing changes
-only the endpoint and payload format — per-model context and output limits still follow the model.
+Because nothing in `/v1/models` reveals the group's platform, the extension confirms the choice
+with the gateway before registering: when the model list contains a Claude id, it sends one
+`POST /v1/messages/count_tokens` (gated by the same flag, takes no concurrency slot, records no
+usage). Only an explicit *"This group does not allow /v1/messages dispatch"* moves everything to
+`openai-completions` — any other outcome, including an unreachable gateway, leaves the native
+protocol in place.
+
+Set `SUB2API_API` to `anthropic` or `openai` to skip that check and force one protocol for every
+model. Forcing changes only the endpoint and payload format — per-model context and output limits
+still follow the model.
 
 ## Use
 
