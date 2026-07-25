@@ -7,7 +7,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
  * pi extension for a sub2api gateway.
  *
  * - Fetches the model list from GET {BASE}/v1/models and registers them as the
- *   "sub2api" provider (openai-completions).
+ *   "sub2api" provider, picking the wire protocol per model (see PROTOCOL below).
  * - Registers a /usage command backed by GET {BASE}/v1/usage (balance and cost).
  *
  * Configuration lives entirely in ~/.pi/agent/auth.json under the provider name
@@ -17,18 +17,46 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
  *     "sub2api": {
  *       "type": "api_key",
  *       "key": "sk-...",
- *       "env": { "SUB2API_BASE_URL": "https://your-sub2api-host" }
+ *       "env": {
+ *         "SUB2API_BASE_URL": "https://your-sub2api-host",
+ *         "SUB2API_API": "auto"
+ *       }
  *     }
  *   }
  *
  * pi resolves the key from auth.json["sub2api"] for inference; this extension reads
  * the same entry for its own /v1/models and /v1/usage calls.
  *
- * Note: only openai-completions works against this gateway; openai-responses and
- * openai-codex-responses did not.
+ * PROTOCOL
+ * sub2api dispatches on the platform of the API key's group, not on the request
+ * path: an Anthropic-account key serves /v1/messages natively and translates
+ * /v1/chat/completions down to it, while an OpenAI-account key does the reverse.
+ * Both paths therefore work for any key, but each costs a translation hop the
+ * native one does not, and groups flagged claude_code_only reject
+ * /v1/chat/completions with 403 outright. So Claude models are registered as
+ * anthropic-messages and everything else as openai-completions. Override with
+ * SUB2API_API: "auto" (default) | "anthropic" | "openai".
+ *
+ * Note: openai-responses and openai-codex-responses do not work against this
+ * gateway; the OpenAI side must stay on openai-completions.
  */
 
 const DEFAULT_BASE = "http://localhost:8080";
+
+/** Wire protocol used to talk to the gateway. */
+type Protocol = "anthropic" | "openai";
+
+/** Per-model protocol selection: follow the model id, or force one protocol. */
+type ProtocolMode = "auto" | Protocol;
+
+function parseProtocolMode(raw: string): ProtocolMode {
+  const value = raw.trim().toLowerCase();
+  if (value === "" || value === "auto") return "auto";
+  if (value === "anthropic" || value === "anthropic-messages") return "anthropic";
+  if (value === "openai" || value === "openai-completions") return "openai";
+  console.warn(`[sub2api] unknown SUB2API_API "${raw}", falling back to "auto" (anthropic | openai | auto).`);
+  return "auto";
+}
 
 function agentDir(): string {
   const override = process.env.PI_CODING_AGENT_DIR;
@@ -43,7 +71,7 @@ function resolveValue(raw: string | undefined, scopedEnv?: Record<string, string
   return raw;
 }
 
-function readSub2apiCredential(): { key: string; base: string } {
+function readSub2apiCredential(): { key: string; base: string; protocol: ProtocolMode } {
   try {
     const authPath = join(agentDir(), "auth.json");
     const data = JSON.parse(readFileSync(authPath, "utf-8")) as Record<
@@ -55,6 +83,7 @@ function readSub2apiCredential(): { key: string; base: string } {
       return {
         key: resolveValue(cred.key, cred.env),
         base: (resolveValue(cred.env?.SUB2API_BASE_URL, cred.env) || DEFAULT_BASE).replace(/\/+$/, ""),
+        protocol: parseProtocolMode(resolveValue(cred.env?.SUB2API_API, cred.env)),
       };
     }
   } catch {
@@ -63,6 +92,7 @@ function readSub2apiCredential(): { key: string; base: string } {
   return {
     key: process.env.SUB2API_KEY ?? "",
     base: (process.env.SUB2API_BASE_URL ?? DEFAULT_BASE).replace(/\/+$/, ""),
+    protocol: parseProtocolMode(process.env.SUB2API_API ?? ""),
   };
 }
 
@@ -123,6 +153,63 @@ async function fetchJson(url: string, key: string, timeoutMs = 8000): Promise<an
   }
 }
 
+/** Everything pi needs to know about one model, beyond its id. */
+interface ModelSpec {
+  protocol: Protocol;
+  reasoning: boolean;
+  contextWindow: number;
+  maxTokens: number;
+  thinkingLevelMap?: Record<string, string | null>;
+}
+
+const isClaudeModel = (id: string) => /claude/i.test(id);
+
+/**
+ * Context and output limits per Claude generation, mirroring pi's built-in
+ * anthropic model table. Ids newer than that table get the 1M context their
+ * generation ships with but a conservative output cap — an under-declared
+ * maxTokens only shortens replies, while an over-declared one is a hard 400.
+ * First match wins.
+ */
+const CLAUDE_SPECS: Array<[RegExp, Omit<ModelSpec, "protocol" | "reasoning">]> = [
+  [/opus-4-6/, { contextWindow: 1000000, maxTokens: 128000, thinkingLevelMap: { xhigh: "max" } }],
+  [/opus-4-7/, { contextWindow: 1000000, maxTokens: 128000, thinkingLevelMap: { xhigh: "xhigh" } }],
+  [/opus-4-8|opus-5|fable-5|sonnet-4-6|sonnet-5/, { contextWindow: 1000000, maxTokens: 64000 }],
+  [/opus-4-[01]|opus-4-2025/, { contextWindow: 200000, maxTokens: 32000 }],
+  [/claude-3-(5-)?(haiku|sonnet|opus)/, { contextWindow: 200000, maxTokens: 8192 }],
+];
+const CLAUDE_FALLBACK: Omit<ModelSpec, "protocol" | "reasoning"> = { contextWindow: 200000, maxTokens: 64000 };
+
+// Everything before Claude 3.7 predates extended thinking.
+const isReasoningClaude = (id: string) => !/claude-3-(?!7-)/i.test(id);
+
+// Codex / gpt-5 / o-series are reasoning models; infer the flag from the id.
+const isReasoningOpenAI = (id: string) => /gpt-5|codex|^o[1-9]|reason|think/i.test(id);
+
+/**
+ * Limits and thinking support follow the model itself; only the wire protocol
+ * follows SUB2API_API. Keeping the two apart means forcing a protocol does not
+ * silently hand a model the other family's context window.
+ */
+function resolveModelSpec(id: string, mode: ProtocolMode): ModelSpec {
+  const isClaude = isClaudeModel(id);
+  const protocol: Protocol = mode === "auto" ? (isClaude ? "anthropic" : "openai") : mode;
+
+  const { reasoning, thinkingLevelMap, ...limits } = isClaude
+    ? { reasoning: isReasoningClaude(id), ...(CLAUDE_SPECS.find(([re]) => re.test(id))?.[1] ?? CLAUDE_FALLBACK) }
+    : { reasoning: isReasoningOpenAI(id), thinkingLevelMap: undefined, contextWindow: 400000, maxTokens: 128000 };
+
+  return {
+    protocol,
+    reasoning,
+    ...limits,
+    // On the OpenAI path upstream rejects reasoning_effort "minimal" (supported:
+    // none/low/medium/high/xhigh), so mark that level unsupported; pi hides it
+    // and clamps a request up to "low".
+    thinkingLevelMap: protocol === "openai" ? (reasoning ? { minimal: null } : undefined) : thinkingLevelMap,
+  };
+}
+
 // Render the GET /v1/usage response as a compact multi-line report.
 function formatUsage(data: any): string {
   const lines = ["sub2api usage"];
@@ -149,10 +236,7 @@ function formatUsage(data: any): string {
 }
 
 export default async function (pi: ExtensionAPI) {
-  const { key, base } = readSub2apiCredential();
-
-  // Codex / gpt-5 / o-series are reasoning models; infer the flag from the id.
-  const isReasoning = (id: string) => /gpt-5|codex|^o[1-9]|reason|think/i.test(id);
+  const { key, base, protocol: protocolMode } = readSub2apiCredential();
 
   const modelsUrl = `${base}/v1/models`;
   if (!key) {
@@ -181,29 +265,41 @@ export default async function (pi: ExtensionAPI) {
     return;
   }
 
+  const specs = models.map((m) => ({ id: m.id, spec: resolveModelSpec(m.id, protocolMode) }));
+
+  // The Anthropic SDK appends /v1/messages to its baseURL, while the OpenAI one
+  // appends /chat/completions to a base that already ends in /v1.
+  const baseUrlFor = (protocol: Protocol) => (protocol === "anthropic" ? base : `${base}/v1`);
+
   // apiKey is required by registerProvider whenever models are defined (presence is
   // validated; auth.json is not consulted here), so pass the key read from auth.json.
   // At request time pi still resolves auth.json["sub2api"] first.
   pi.registerProvider("sub2api", {
     name: "Sub2API",
-    baseUrl: `${base}/v1`,
+    baseUrl: baseUrlFor("openai"),
     api: "openai-completions",
     apiKey: key,
-    models: models.map((m) => ({
-      id: m.id,
-      name: m.id,
-      reasoning: isReasoning(m.id),
-      // Upstream rejects reasoning_effort "minimal" (supported: none/low/medium/high/xhigh),
-      // so mark that level unsupported; pi hides it and clamps a request up to "low".
-      thinkingLevelMap: isReasoning(m.id) ? { minimal: null } : undefined,
+    models: specs.map(({ id, spec }) => ({
+      id,
+      name: id,
+      api: spec.protocol === "anthropic" ? "anthropic-messages" : "openai-completions",
+      baseUrl: baseUrlFor(spec.protocol),
+      reasoning: spec.reasoning,
+      thinkingLevelMap: spec.thinkingLevelMap,
       input: ["text", "image"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 400000,
-      maxTokens: 128000,
+      contextWindow: spec.contextWindow,
+      maxTokens: spec.maxTokens,
     })),
   });
 
-  console.log(`[sub2api] registered ${models.length} model(s): ${models.map((m) => m.id).join(", ")}`);
+  const byProtocol = (protocol: Protocol) => specs.filter((s) => s.spec.protocol === protocol).map((s) => s.id);
+  const summary = (["anthropic", "openai"] as const)
+    .map((protocol) => ({ protocol, ids: byProtocol(protocol) }))
+    .filter(({ ids }) => ids.length > 0)
+    .map(({ protocol, ids }) => `${protocol === "anthropic" ? "anthropic-messages" : "openai-completions"}: ${ids.join(", ")}`)
+    .join(" | ");
+  console.log(`[sub2api] registered ${specs.length} model(s) — ${summary}`);
 
   // /usage: sub2api tracks authoritative cost/balance at GET /v1/usage (same key).
   pi.registerCommand("usage", {
