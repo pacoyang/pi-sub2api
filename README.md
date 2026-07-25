@@ -66,7 +66,17 @@ only the endpoint and payload format — per-model context and output limits sti
 
 ### When to force it
 
-Each side has a group flag that closes its non-native path outright:
+The default rule infers the backend platform from the model name, so forcing is for the cases
+where the name does not match the backend.
+
+**Force `anthropic`** when an Anthropic group publishes model ids without `claude` in them —
+aliases like `sonnet-latest` or `my-coding-model`. Nothing fails: the request goes to
+`/v1/chat/completions` and the gateway translates it back to Anthropic format. But the hop is
+wasted, and it is the lossier direction — thinking blocks and cache control survive the native
+path better.
+
+**Force `openai`** when the reverse happens. Each side has a group flag that closes its non-native
+path outright:
 
 - `claude_code_only` — rejects `/v1/chat/completions` with a 403. Harmless here: such a group is
   Anthropic-platform and serves Claude ids, which already go to `/v1/messages`.
@@ -88,6 +98,21 @@ When it does happen the first request fails loudly and says exactly why:
 
 Fix it by setting `SUB2API_API` to `openai`, or by turning on `allow_messages_dispatch` for the
 group.
+
+### Confirming the split
+
+The startup line reports which protocol each model landed on:
+
+```bash
+pi --list-models
+```
+
+```
+[sub2api] registered 12 model(s) — anthropic-messages: claude-opus-4-7, claude-sonnet-4-6 | openai-completions: gpt-5.5, gpt-5.4
+```
+
+After forcing, only one side should remain. Note that this line is only readable in
+`--list-models` and print mode — the interactive TUI clears the screen as it starts.
 
 ## Use
 
