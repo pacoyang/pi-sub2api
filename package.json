@@ -1,6 +1,6 @@
 {
   "name": "pi-sub2api",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Pi extension for a sub2api gateway: dynamic model registration and a /usage command for balance and cost.",
   "type": "module",
   "license": "MIT",
