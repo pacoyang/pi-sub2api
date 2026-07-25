@@ -31,13 +31,18 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
  * sub2api dispatches on the platform of the API key's group, not on the request
  * path: an Anthropic-account key serves /v1/messages natively and translates
  * /v1/chat/completions down to it, while an OpenAI-account key does the reverse.
- * The non-native path costs a translation hop, and each side has a group flag
- * that closes it outright — claude_code_only rejects /v1/chat/completions, and
- * an OpenAI group rejects /v1/messages unless allow_messages_dispatch is on
- * (it defaults to off). So Claude models are registered as anthropic-messages
- * and everything else as openai-completions, after confirming with the gateway
- * that /v1/messages is open to this key. Override the whole decision with
- * SUB2API_API: "auto" (default) | "anthropic" | "openai".
+ * The non-native path costs a translation hop, so Claude models are registered
+ * as anthropic-messages and everything else as openai-completions.
+ *
+ * Each side also has a group flag that closes its non-native path outright:
+ * claude_code_only rejects /v1/chat/completions, and an OpenAI group rejects
+ * /v1/messages unless allow_messages_dispatch is on (it defaults to off). Only
+ * the second one can bite the rule above, and only for a key whose /v1/models
+ * lists Claude ids while its group is OpenAI-platform — an operator has to put
+ * those ids in an account's model_mapping for that to happen. The gateway says
+ * so plainly when it does ("This group does not allow /v1/messages dispatch"),
+ * so that case is left to SUB2API_API rather than probed for: "auto" (default)
+ * | "anthropic" | "openai".
  *
  * Note: openai-responses and openai-codex-responses do not work against this
  * gateway; the OpenAI side must stay on openai-completions.
@@ -118,36 +123,11 @@ function describeErrorBody(body: string): string {
   return text.length > 400 ? `${text.slice(0, 400)}…` : text;
 }
 
-/**
- * An error carrying the HTTP status and parsed message of a failed response.
- * Kept as a plain Error with extra fields rather than a subclass, so the file
- * stays loadable by any TypeScript loader, including type-stripping ones.
- */
-type HttpError = Error & { status: number; detail: string };
-
-const httpError = (message: string, status: number, detail: string): HttpError =>
-  Object.assign(new Error(message), { status, detail });
-
-const isHttpError = (err: unknown): err is HttpError =>
-  err instanceof Error && typeof (err as Partial<HttpError>).status === "number";
-
-async function requestJson(
-  method: "GET" | "POST",
-  url: string,
-  key: string,
-  payload?: unknown,
-  timeoutMs = 8000,
-): Promise<any> {
+async function fetchJson(url: string, key: string, timeoutMs = 8000): Promise<any> {
   let res: Response;
   try {
     res = await fetch(url, {
-      method,
-      headers: {
-        Authorization: `Bearer ${key}`,
-        Accept: "application/json",
-        ...(payload === undefined ? {} : { "Content-Type": "application/json" }),
-      },
-      body: payload === undefined ? undefined : JSON.stringify(payload),
+      headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (err) {
@@ -159,7 +139,7 @@ async function requestJson(
       e.name === "TimeoutError"
         ? `timed out after ${timeoutMs}ms`
         : `${e.message}${cause ? ` (${cause})` : ""}`;
-    throw new Error(`${method} ${url} failed — ${reason}`);
+    throw new Error(`GET ${url} failed — ${reason}`);
   }
   // statusText is empty over HTTP/2, so only append it when present.
   const status = `HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ""}`;
@@ -167,21 +147,18 @@ async function requestJson(
   try {
     body = await res.text();
   } catch (err) {
-    throw new Error(`${method} ${url} → ${status} but the body could not be read — ${(err as Error).message}`);
+    throw new Error(`GET ${url} → ${status} but the body could not be read — ${(err as Error).message}`);
   }
   if (!res.ok) {
     const detail = describeErrorBody(body);
-    throw httpError(`${method} ${url} → ${status}${detail ? ` — ${detail}` : ""}`, res.status, detail);
+    throw new Error(`GET ${url} → ${status}${detail ? ` — ${detail}` : ""}`);
   }
   try {
     return JSON.parse(body);
   } catch {
-    throw new Error(`${method} ${url} → ${status} but the body is not JSON — ${describeErrorBody(body)}`);
+    throw new Error(`GET ${url} → ${status} but the body is not JSON — ${describeErrorBody(body)}`);
   }
 }
-
-const fetchJson = (url: string, key: string, timeoutMs?: number) =>
-  requestJson("GET", url, key, undefined, timeoutMs);
 
 /** Everything pi needs to know about one model, beyond its id. */
 interface ModelSpec {
@@ -240,35 +217,6 @@ function resolveModelSpec(id: string, mode: ProtocolMode): ModelSpec {
   };
 }
 
-/**
- * Ask the gateway whether this key may use /v1/messages at all.
- *
- * An OpenAI-platform group rejects /v1/messages unless an admin turned on its
- * allow_messages_dispatch flag, which defaults to off — so a Claude model id
- * served by such a group has to stay on the OpenAI path. Nothing in
- * /v1/models reveals the group's platform, so ask directly:
- * POST /v1/messages/count_tokens is behind the same flag, takes no concurrency
- * slot and records no usage.
- *
- * Only an explicit denial counts. Any other outcome — no account available,
- * rate limit, a platform without token counting, an unreachable gateway —
- * leaves the native protocol in place rather than downgrading on a guess.
- */
-async function messagesDispatchDenied(base: string, key: string, model: string): Promise<boolean> {
-  try {
-    await requestJson("POST", `${base}/v1/messages/count_tokens`, key, {
-      model,
-      messages: [{ role: "user", content: "hi" }],
-    });
-    return false;
-  } catch (err) {
-    if (isHttpError(err) && err.status === 403 && /messages dispatch/i.test(err.detail)) {
-      return true;
-    }
-    return false;
-  }
-}
-
 // Render the GET /v1/usage response as a compact multi-line report.
 function formatUsage(data: any): string {
   const lines = ["sub2api usage"];
@@ -324,16 +272,7 @@ export default async function (pi: ExtensionAPI) {
     return;
   }
 
-  // "auto" would put Claude ids on /v1/messages; confirm the key may use it
-  // before committing, since an OpenAI group serving Claude ids may not.
-  let mode = protocolMode;
-  const firstClaude = models.find((m) => isClaudeModel(m.id))?.id;
-  if (mode === "auto" && firstClaude && (await messagesDispatchDenied(base, key, firstClaude))) {
-    mode = "openai";
-    console.log("[sub2api] this key's group does not allow /v1/messages dispatch; using openai-completions for all models.");
-  }
-
-  const specs = models.map((m) => ({ id: m.id, spec: resolveModelSpec(m.id, mode) }));
+  const specs = models.map((m) => ({ id: m.id, spec: resolveModelSpec(m.id, protocolMode) }));
 
   // The Anthropic SDK appends /v1/messages to its baseURL, while the OpenAI one
   // appends /chat/completions to a base that already ends in /v1.

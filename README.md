@@ -53,31 +53,41 @@ environment variables are used as a fallback if the `auth.json` entry is absent.
 
 sub2api dispatches on the platform of the API key's group, not on the request path. An
 Anthropic-account key serves `/v1/messages` natively and translates `/v1/chat/completions` down to
-it; an OpenAI-account key does the reverse. The non-native path costs a translation hop, and each
-side has a group flag that closes it outright:
-
-- `claude_code_only` — rejects `/v1/chat/completions` with a 403.
-- `allow_messages_dispatch` — an OpenAI group rejects `/v1/messages` unless this is on. **It
-  defaults to off**, so an OpenAI group that serves Claude model ids will not accept the Anthropic
-  protocol until an admin enables it.
-
-So each model is registered on the protocol native to it:
+it; an OpenAI-account key does the reverse. The non-native path costs a translation hop, so each
+model is registered on the protocol native to it:
 
 | Model id | pi API | Endpoint |
 | --- | --- | --- |
 | `claude-*` | `anthropic-messages` | `POST {BASE}/v1/messages` |
 | everything else | `openai-completions` | `POST {BASE}/v1/chat/completions` |
 
-Because nothing in `/v1/models` reveals the group's platform, the extension confirms the choice
-with the gateway before registering: when the model list contains a Claude id, it sends one
-`POST /v1/messages/count_tokens` (gated by the same flag, takes no concurrency slot, records no
-usage). Only an explicit *"This group does not allow /v1/messages dispatch"* moves everything to
-`openai-completions` — any other outcome, including an unreachable gateway, leaves the native
-protocol in place.
+Set `SUB2API_API` to `anthropic` or `openai` to force one protocol for every model. Forcing changes
+only the endpoint and payload format — per-model context and output limits still follow the model.
 
-Set `SUB2API_API` to `anthropic` or `openai` to skip that check and force one protocol for every
-model. Forcing changes only the endpoint and payload format — per-model context and output limits
-still follow the model.
+### When to force it
+
+Each side has a group flag that closes its non-native path outright:
+
+- `claude_code_only` — rejects `/v1/chat/completions` with a 403. Harmless here: such a group is
+  Anthropic-platform and serves Claude ids, which already go to `/v1/messages`.
+- `allow_messages_dispatch` — an OpenAI group rejects `/v1/messages` unless this is on, and **it
+  defaults to off**.
+
+Only the second one can bite, and only for a key whose model list carries Claude ids while its
+group is OpenAI-platform. That takes a deliberate setup: `/v1/models` publishes the keys of each
+account's `model_mapping`, so an operator has to have mapped something like
+`"claude-sonnet-4-5": "gpt-5.5"` onto an OpenAI account. (The group-level
+`messages_dispatch_model_config` that normally points Claude Code at OpenAI accounts does not
+appear in the model list, so the usual setup is unaffected.)
+
+When it does happen the first request fails loudly and says exactly why:
+
+```
+403 {"type":"permission_error","message":"This group does not allow /v1/messages dispatch"}
+```
+
+Fix it by setting `SUB2API_API` to `openai`, or by turning on `allow_messages_dispatch` for the
+group.
 
 ## Use
 
