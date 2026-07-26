@@ -39,9 +39,8 @@ chmod 600 ~/.pi/agent/auth.json
 - `key` — an API key generated in the sub2api dashboard.
 - `env.SUB2API_BASE_URL` — the gateway base URL, **without** a trailing `/v1`. Defaults to
   `http://localhost:8080`.
-- `env.SUB2API_PROTOCOL` — optional. Forces the wire protocol to `anthropic` or `openai`; omit it
-  to pick per model, which is what you want unless [Protocol](#protocol) says otherwise. (Named
-  `SUB2API_API` up to 0.2.2; the old name still works.)
+- `env.SUB2API_PROTOCOL` — optional, and normally left out. Pins every model to one wire protocol
+  instead of letting the extension choose. See [Protocol](#protocol).
 
 pi resolves the key from `auth.json["sub2api"]` for inference; the extension reads the same entry
 for its own `/v1/models` and `/v1/usage` calls. `SUB2API_KEY` / `SUB2API_BASE_URL` /
@@ -52,31 +51,73 @@ absent.
 
 sub2api dispatches on the platform of the API key's group, not on the request path. An
 Anthropic-account key serves `/v1/messages` natively and translates `/v1/chat/completions` down to
-it; an OpenAI-account key does the reverse. The non-native path costs a translation hop, so each
-model is registered on the protocol native to it:
+it; an OpenAI-account key does the reverse. The non-native path costs a translation hop.
 
-| Model id | pi API | Endpoint |
+**You do not have to configure this.** Left alone, the extension reads each model id and registers
+it on the protocol native to it:
+
+| Model id | pi `api` | Endpoint |
 | --- | --- | --- |
 | `claude-*` | `anthropic-messages` | `POST {BASE}/v1/messages` |
 | everything else | `openai-completions` | `POST {BASE}/v1/chat/completions` |
 
-Set `SUB2API_PROTOCOL` to `anthropic` or `openai` to force one protocol for every model. Forcing
-changes only the endpoint and payload format — per-model context and output limits still follow
-the model.
+A model list of only Claude ids therefore ends up entirely on the Anthropic protocol, a list of
+only GPT ids entirely on the OpenAI one, and a mixed list split between them — one provider, two
+protocols. This is the `auto` behaviour, and it is what you get when `SUB2API_PROTOCOL` is unset.
+
+Set it only to overrule that guess. Values are pi's own api names, since that is what they become:
+
+| `SUB2API_PROTOCOL` | Effect |
+| --- | --- |
+| unset, or `auto` | per model, per the table above |
+| `anthropic-messages` | every model on `POST {BASE}/v1/messages` |
+| `openai-completions` | every model on `POST {BASE}/v1/chat/completions` |
+| `openai-responses` | every model on `POST {BASE}/v1/responses` |
+
+Forcing changes only the endpoint and payload format — per-model context and output limits still
+follow the model.
+
+### openai-responses
+
+On an OpenAI group the gateway's own upstream is the Responses API — `DeriveUpstreamEndpoint`
+sends every OpenAI request to `/v1/responses` regardless of how it arrived. So the default
+`openai-completions` is itself a conversion: the reply comes back with a `resp_…` id and
+`"object": "chat.completion.chunk"`, having been translated down from a Responses stream.
+
+Going in as `openai-responses` skips that, and buys one thing the chat path cannot give:
+
+| | `openai-completions` | `openai-responses` |
+| --- | --- | --- |
+| Thinking shown | yes, via `reasoning_content` | yes, via reasoning items |
+| Reasoning replayed next turn | no | yes — `reasoning.encrypted_content` |
+
+pi stores each reasoning item and feeds it back on the following turn, so a GPT-5 model keeps its
+reasoning chain across a tool loop instead of restarting it every time.
+
+It is opt-in rather than the default because an API-key account whose upstream lacks the Responses
+API is served on the raw chat path instead (`resolveOpenAIUpstreamEndpoint`), and that setup has
+not been tested here. To use it:
+
+```json
+"env": {
+  "SUB2API_BASE_URL": "https://your-sub2api-host",
+  "SUB2API_PROTOCOL": "openai-responses"
+}
+```
 
 ### When to force it
 
 The default rule infers the backend platform from the model name, so forcing is for the cases
 where the name does not match the backend.
 
-**Force `anthropic`** when an Anthropic group publishes model ids without `claude` in them —
-aliases like `sonnet-latest` or `my-coding-model`. Nothing fails: the request goes to
+**Force `anthropic-messages`** when an Anthropic group publishes model ids without `claude` in
+them — aliases like `sonnet-latest` or `my-coding-model`. Nothing fails: the request goes to
 `/v1/chat/completions` and the gateway translates it back to Anthropic format. But the hop is
 wasted, and it is the lossier direction — thinking blocks and cache control survive the native
 path better.
 
-**Force `openai`** when the reverse happens. Each side has a group flag that closes its non-native
-path outright:
+**Force `openai-completions`** when the reverse happens. Each side has a group flag that closes
+its non-native path outright:
 
 - `claude_code_only` — rejects `/v1/chat/completions` with a 403. Harmless here: such a group is
   Anthropic-platform and serves Claude ids, which already go to `/v1/messages`.
@@ -96,8 +137,8 @@ When it does happen the first request fails loudly and says exactly why:
 403 {"type":"permission_error","message":"This group does not allow /v1/messages dispatch"}
 ```
 
-Fix it by setting `SUB2API_PROTOCOL` to `openai`, or by turning on `allow_messages_dispatch` for
-the group.
+Fix it by setting `SUB2API_PROTOCOL` to `openai-completions`, or by turning on
+`allow_messages_dispatch` for the group.
 
 ### Confirming the split
 
@@ -135,8 +176,11 @@ sub2api usage
 
 ## Notes
 
-- **API type**: `openai-responses` and `openai-codex-responses` did not work against this gateway,
-  so the OpenAI side stays on `openai-completions`. See [Protocol](#protocol).
+- **API type**: the OpenAI side defaults to `openai-completions`;
+  [`openai-responses`](#openai-responses) is available and is the gateway's native path.
+  `openai-codex-responses` is not wired up: pi builds its URL as `{baseUrl}/codex/responses`, so it
+  needs `{BASE}/backend-api/codex` as the base rather than `{BASE}/v1`. That route does answer, so
+  supporting it is possible — it just needs its own base URL.
 - **Cost**: pi's per-token `cost` is set to `0`, because sub2api's `/v1/models` returns no pricing.
   Cost comes from the gateway's own accounting via `/usage`, not from pi's estimate.
 - **Model list**: embedding and image-generation models are filtered out; only chat-capable models
