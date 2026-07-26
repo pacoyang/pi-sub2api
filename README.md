@@ -39,12 +39,14 @@ chmod 600 ~/.pi/agent/auth.json
 - `key` — an API key generated in the sub2api dashboard.
 - `env.SUB2API_BASE_URL` — the gateway base URL, **without** a trailing `/v1`. Defaults to
   `http://localhost:8080`.
-- `env.SUB2API_API` — optional. Forces the wire protocol to `anthropic` or `openai`; omit it to
-  pick per model, which is what you want unless [Protocol](#protocol) says otherwise.
+- `env.SUB2API_PROTOCOL` — optional. Forces the wire protocol to `anthropic` or `openai`; omit it
+  to pick per model, which is what you want unless [Protocol](#protocol) says otherwise. (Named
+  `SUB2API_API` up to 0.2.2; the old name still works.)
 
 pi resolves the key from `auth.json["sub2api"]` for inference; the extension reads the same entry
-for its own `/v1/models` and `/v1/usage` calls. `SUB2API_KEY` / `SUB2API_BASE_URL` / `SUB2API_API`
-environment variables are used as a fallback if the `auth.json` entry is absent.
+for its own `/v1/models` and `/v1/usage` calls. `SUB2API_KEY` / `SUB2API_BASE_URL` /
+`SUB2API_PROTOCOL` environment variables are used as a fallback if the `auth.json` entry is
+absent.
 
 ## Protocol
 
@@ -58,8 +60,9 @@ model is registered on the protocol native to it:
 | `claude-*` | `anthropic-messages` | `POST {BASE}/v1/messages` |
 | everything else | `openai-completions` | `POST {BASE}/v1/chat/completions` |
 
-Set `SUB2API_API` to `anthropic` or `openai` to force one protocol for every model. Forcing changes
-only the endpoint and payload format — per-model context and output limits still follow the model.
+Set `SUB2API_PROTOCOL` to `anthropic` or `openai` to force one protocol for every model. Forcing
+changes only the endpoint and payload format — per-model context and output limits still follow
+the model.
 
 ### When to force it
 
@@ -93,8 +96,8 @@ When it does happen the first request fails loudly and says exactly why:
 403 {"type":"permission_error","message":"This group does not allow /v1/messages dispatch"}
 ```
 
-Fix it by setting `SUB2API_API` to `openai`, or by turning on `allow_messages_dispatch` for the
-group.
+Fix it by setting `SUB2API_PROTOCOL` to `openai`, or by turning on `allow_messages_dispatch` for
+the group.
 
 ### Confirming the split
 

@@ -21,8 +21,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
  *     }
  *   }
  *
- * SUB2API_API may be added to that env block to force a protocol; leaving it
- * out picks one per model (see PROTOCOL below).
+ * SUB2API_PROTOCOL may be added to that env block to force a protocol; leaving
+ * it out picks one per model (see PROTOCOL below).
  *
  * pi resolves the key from auth.json["sub2api"] for inference; this extension reads
  * the same entry for its own /v1/models and /v1/usage calls.
@@ -41,8 +41,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
  * lists Claude ids while its group is OpenAI-platform — an operator has to put
  * those ids in an account's model_mapping for that to happen. The gateway says
  * so plainly when it does ("This group does not allow /v1/messages dispatch"),
- * so that case is left to SUB2API_API rather than probed for: "auto" (default)
- * | "anthropic" | "openai".
+ * so that case is left to SUB2API_PROTOCOL rather than probed for: "auto"
+ * (default) | "anthropic" | "openai".
  *
  * Note: openai-responses and openai-codex-responses do not work against this
  * gateway; the OpenAI side must stay on openai-completions.
@@ -56,12 +56,29 @@ type Protocol = "anthropic" | "openai";
 /** Per-model protocol selection: follow the model id, or force one protocol. */
 type ProtocolMode = "auto" | Protocol;
 
-function parseProtocolMode(raw: string): ProtocolMode {
+function parseProtocolMode(raw: string, source = "SUB2API_PROTOCOL"): ProtocolMode {
   const value = raw.trim().toLowerCase();
   if (value === "" || value === "auto") return "auto";
   if (value === "anthropic" || value === "anthropic-messages") return "anthropic";
   if (value === "openai" || value === "openai-completions") return "openai";
-  console.warn(`[sub2api] unknown SUB2API_API "${raw}", falling back to "auto" (anthropic | openai | auto).`);
+  console.warn(`[sub2api] unknown ${source} "${raw}", falling back to "auto" (anthropic | openai | auto).`);
+  return "auto";
+}
+
+/**
+ * Read the protocol override from one config source. SUB2API_API was the name
+ * up to 0.2.2 and still works: silently ignoring it would drop an override
+ * someone set to route around a gateway restriction.
+ */
+function readProtocolMode(lookup: (name: string) => string | undefined): ProtocolMode {
+  const current = lookup("SUB2API_PROTOCOL");
+  if (current) return parseProtocolMode(current);
+
+  const legacy = lookup("SUB2API_API");
+  if (legacy) {
+    console.warn("[sub2api] SUB2API_API has been renamed to SUB2API_PROTOCOL; the old name still works.");
+    return parseProtocolMode(legacy, "SUB2API_API");
+  }
   return "auto";
 }
 
@@ -90,7 +107,7 @@ function readSub2apiCredential(): { key: string; base: string; protocol: Protoco
       return {
         key: resolveValue(cred.key, cred.env),
         base: (resolveValue(cred.env?.SUB2API_BASE_URL, cred.env) || DEFAULT_BASE).replace(/\/+$/, ""),
-        protocol: parseProtocolMode(resolveValue(cred.env?.SUB2API_API, cred.env)),
+        protocol: readProtocolMode((name) => resolveValue(cred.env?.[name], cred.env)),
       };
     }
   } catch {
@@ -99,7 +116,7 @@ function readSub2apiCredential(): { key: string; base: string; protocol: Protoco
   return {
     key: process.env.SUB2API_KEY ?? "",
     base: (process.env.SUB2API_BASE_URL ?? DEFAULT_BASE).replace(/\/+$/, ""),
-    protocol: parseProtocolMode(process.env.SUB2API_API ?? ""),
+    protocol: readProtocolMode((name) => process.env[name]),
   };
 }
 
@@ -195,7 +212,7 @@ const isReasoningOpenAI = (id: string) => /gpt-5|codex|^o[1-9]|reason|think/i.te
 
 /**
  * Limits and thinking support follow the model itself; only the wire protocol
- * follows SUB2API_API. Keeping the two apart means forcing a protocol does not
+ * follows SUB2API_PROTOCOL. Keeping the two apart means forcing a protocol does not
  * silently hand a model the other family's context window.
  */
 function resolveModelSpec(id: string, mode: ProtocolMode): ModelSpec {
