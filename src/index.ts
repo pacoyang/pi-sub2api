@@ -42,26 +42,39 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
  * those ids in an account's model_mapping for that to happen. The gateway says
  * so plainly when it does ("This group does not allow /v1/messages dispatch"),
  * so that case is left to SUB2API_PROTOCOL rather than probed for: "auto"
- * (default) | "anthropic" | "openai".
+ * (default) | "anthropic-messages" | "openai-completions" | "openai-responses".
  *
- * Note: openai-responses and openai-codex-responses do not work against this
- * gateway; the OpenAI side must stay on openai-completions.
+ * On an OpenAI group the gateway's own upstream is the Responses API, so
+ * openai-completions is itself a conversion — openai-responses skips it and is
+ * the only path that returns encrypted reasoning content for pi to replay on
+ * the next turn. It is opt-in for now (SUB2API_PROTOCOL=openai-responses)
+ * because an API-key account whose upstream lacks the Responses API is served
+ * on the raw chat path instead, and that setup is untested here.
  */
 
 const DEFAULT_BASE = "http://localhost:8080";
 
-/** Wire protocol used to talk to the gateway. */
-type Protocol = "anthropic" | "openai";
+/** Wire protocol used to talk to the gateway, named as pi's api types. */
+type Protocol = "anthropic-messages" | "openai-completions" | "openai-responses";
 
 /** Per-model protocol selection: follow the model id, or force one protocol. */
 type ProtocolMode = "auto" | Protocol;
 
+/**
+ * A value is pi's own api name, since that is what it ends up as. "anthropic"
+ * and "openai" are kept because they were the documented spellings through
+ * 0.2.3; no new shorthands — the canonical name is the api name.
+ */
 function parseProtocolMode(raw: string, source = "SUB2API_PROTOCOL"): ProtocolMode {
   const value = raw.trim().toLowerCase();
   if (value === "" || value === "auto") return "auto";
-  if (value === "anthropic" || value === "anthropic-messages") return "anthropic";
-  if (value === "openai" || value === "openai-completions") return "openai";
-  console.warn(`[sub2api] unknown ${source} "${raw}", falling back to "auto" (anthropic | openai | auto).`);
+  if (value === "anthropic-messages" || value === "anthropic") return "anthropic-messages";
+  if (value === "openai-completions" || value === "openai") return "openai-completions";
+  if (value === "openai-responses") return "openai-responses";
+  console.warn(
+    `[sub2api] unknown ${source} "${raw}", falling back to "auto" ` +
+      "(auto | anthropic-messages | openai-completions | openai-responses).",
+  );
   return "auto";
 }
 
@@ -217,7 +230,7 @@ const isReasoningOpenAI = (id: string) => /gpt-5|codex|^o[1-9]|reason|think/i.te
  */
 function resolveModelSpec(id: string, mode: ProtocolMode): ModelSpec {
   const isClaude = isClaudeModel(id);
-  const protocol: Protocol = mode === "auto" ? (isClaude ? "anthropic" : "openai") : mode;
+  const protocol: Protocol = mode === "auto" ? (isClaude ? "anthropic-messages" : "openai-completions") : mode;
 
   const { reasoning, thinkingLevelMap, ...limits } = isClaude
     ? { reasoning: isReasoningClaude(id), ...(CLAUDE_SPECS.find(([re]) => re.test(id))?.[1] ?? CLAUDE_FALLBACK) }
@@ -227,10 +240,11 @@ function resolveModelSpec(id: string, mode: ProtocolMode): ModelSpec {
     protocol,
     reasoning,
     ...limits,
-    // On the OpenAI path upstream rejects reasoning_effort "minimal" (supported:
+    // On either OpenAI path upstream rejects reasoning_effort "minimal" (supported:
     // none/low/medium/high/xhigh), so mark that level unsupported; pi hides it
     // and clamps a request up to "low".
-    thinkingLevelMap: protocol === "openai" ? (reasoning ? { minimal: null } : undefined) : thinkingLevelMap,
+    thinkingLevelMap:
+      protocol === "anthropic-messages" ? thinkingLevelMap : reasoning ? { minimal: null } : undefined,
   };
 }
 
@@ -291,22 +305,22 @@ export default async function (pi: ExtensionAPI) {
 
   const specs = models.map((m) => ({ id: m.id, spec: resolveModelSpec(m.id, protocolMode) }));
 
-  // The Anthropic SDK appends /v1/messages to its baseURL, while the OpenAI one
-  // appends /chat/completions to a base that already ends in /v1.
-  const baseUrlFor = (protocol: Protocol) => (protocol === "anthropic" ? base : `${base}/v1`);
+  // The Anthropic SDK appends /v1/messages to its baseURL, while the OpenAI ones
+  // append /chat/completions or /responses to a base that already ends in /v1.
+  const baseUrlFor = (protocol: Protocol) => (protocol === "anthropic-messages" ? base : `${base}/v1`);
 
   // apiKey is required by registerProvider whenever models are defined (presence is
   // validated; auth.json is not consulted here), so pass the key read from auth.json.
   // At request time pi still resolves auth.json["sub2api"] first.
   pi.registerProvider("sub2api", {
     name: "Sub2API",
-    baseUrl: baseUrlFor("openai"),
+    baseUrl: baseUrlFor("openai-completions"),
     api: "openai-completions",
     apiKey: key,
     models: specs.map(({ id, spec }) => ({
       id,
       name: id,
-      api: spec.protocol === "anthropic" ? "anthropic-messages" : "openai-completions",
+      api: spec.protocol,
       baseUrl: baseUrlFor(spec.protocol),
       reasoning: spec.reasoning,
       thinkingLevelMap: spec.thinkingLevelMap,
@@ -317,11 +331,10 @@ export default async function (pi: ExtensionAPI) {
     })),
   });
 
-  const byProtocol = (protocol: Protocol) => specs.filter((s) => s.spec.protocol === protocol).map((s) => s.id);
-  const summary = (["anthropic", "openai"] as const)
-    .map((protocol) => ({ protocol, ids: byProtocol(protocol) }))
+  const summary = (["anthropic-messages", "openai-completions", "openai-responses"] as const)
+    .map((protocol) => ({ protocol, ids: specs.filter((s) => s.spec.protocol === protocol).map((s) => s.id) }))
     .filter(({ ids }) => ids.length > 0)
-    .map(({ protocol, ids }) => `${protocol === "anthropic" ? "anthropic-messages" : "openai-completions"}: ${ids.join(", ")}`)
+    .map(({ protocol, ids }) => `${protocol}: ${ids.join(", ")}`)
     .join(" | ");
   console.log(`[sub2api] registered ${specs.length} model(s) — ${summary}`);
 
