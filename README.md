@@ -1,9 +1,30 @@
 # pi-sub2api
 
-A [pi](https://pi.dev) extension for a [sub2api](https://github.com/Wei-Shaw/sub2api) gateway.
+[![npm](https://img.shields.io/npm/v/pi-sub2api?style=flat-square)](https://www.npmjs.com/package/pi-sub2api)
+[![node](https://img.shields.io/node/v/pi-sub2api?style=flat-square)](https://nodejs.org)
+[![license](https://img.shields.io/npm/l/pi-sub2api?style=flat-square)](LICENSE)
 
-- Fetches the model list from the gateway at startup and registers it as the `sub2api` provider.
-- Adds a `/usage` command showing balance and today/total cost.
+**Use a [sub2api](https://github.com/Wei-Shaw/sub2api) gateway from the [Pi coding agent](https://pi.dev).**
+
+sub2api puts one API key in front of several upstream accounts. This extension makes that
+gateway look like a normal pi provider: it reads the model list at startup and registers
+every chat-capable model, so `--model sub2api/...` just works and `/models` lists them.
+
+Two things it does that a plain base-URL override cannot. It picks the wire protocol per
+model, because sub2api dispatches on the *key's* platform rather than the request path and
+the wrong choice costs a translation hop — see [Protocol](#protocol). And it adds
+`/usage`, which reports the gateway's own accounting rather than a token estimate, since
+`/v1/models` returns no pricing for pi to estimate from.
+
+## Table of Contents
+
+- [Install](#install)
+- [Configure](#configure)
+- [Protocol](#protocol)
+- [Use](#use)
+- [Notes](#notes)
+- [Development](#development)
+- [License](#license)
 
 ## Install
 
@@ -192,6 +213,24 @@ sub2api usage
   Anthropic values, and everything else gets 400000/128000. Claude ids newer than that table get
   their generation's context window with a conservative output cap: an under-declared `maxTokens`
   only shortens replies, while an over-declared one is a hard 400.
+
+## Development
+
+```bash
+npm install
+npm run check          # tsc --noEmit
+npm run pack:dry-run   # what would ship
+```
+
+There is no build step and no test suite. The package ships TypeScript, which pi loads
+through jiti, so `pi -e /path/to/pi-sub2api` runs a checkout exactly as an installed copy
+runs. The extension is one file: `src/index.ts`.
+
+Typechecking is the only automated gate, and it is worth saying what that does not cover.
+Everything interesting here is a claim about a live gateway — which protocol a key's
+platform serves natively, what `/v1/models` omits, which `reasoning_effort` values the
+upstream rejects — and none of it can be verified without pointing the extension at a real
+sub2api instance. Those claims are recorded in [Notes](#notes) as what was observed.
 
 ## License
 
